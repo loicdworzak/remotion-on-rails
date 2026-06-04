@@ -31,7 +31,7 @@ app.use(express.static(path.resolve("build")));
 createBullDashboardAndAttachRouter(app);
 
 app.post("/render", async (req, res) => {
-  const { compositionId, inputProps } = req.body as Partial<RenderMediaRequest>;
+  const { compositionId, inputProps, serveUrl } = req.body as Partial<RenderMediaRequest>;
 
   if (!compositionId) {
     return res.status(400).json({ error: "missing compositionId" });
