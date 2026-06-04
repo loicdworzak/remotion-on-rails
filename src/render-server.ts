@@ -42,12 +42,13 @@ app.post("/render", async (req, res) => {
   const outPath = `${outDirectory}/${fileName}`;
 
   try {
-    await addToRenderMediaQueue({
-      renderId,
-      inputProps: inputProps ?? {},
-      compositionId,
-      outputLocation: outPath,
-    });
+await addToRenderMediaQueue({
+  renderId,
+  inputProps: inputProps ?? {},
+  compositionId,
+  outputLocation: outPath,
+  serveUrl,          // ← AJOUTER
+});
 
     await state.prisma.renders.create({
       data: {
