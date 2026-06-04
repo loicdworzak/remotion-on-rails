@@ -11,7 +11,7 @@ const queue = createQueue(queueName);
 const worker = createWorker(queueName, async (job: Job) => {
   const data = job.data as RenderMediaRequest;
 
-  const serveUrl = `http://localhost:${process.env.PORT}`;
+  const serveUrl = data.serveUrl ?? `http://localhost:${process.env.PORT}`;
 
   const composition = await selectComposition({
     inputProps: data.inputProps,
