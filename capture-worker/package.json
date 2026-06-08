@@ -1,1 +1,16 @@
-
+{
+  "name": "nemo-capture-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Playwright screen-recording worker that captures Nemo's /capture page into a pixel-perfect MP4.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "ffmpeg-static": "^5.2.0",
+    "playwright": "^1.49.1"
+  }
+}
