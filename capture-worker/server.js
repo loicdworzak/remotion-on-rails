@@ -19,8 +19,8 @@
  * Env:
  *   PORT                 (Railway sets this automatically)
  *   CAPTURE_TOKEN        (optional) bearer token to protect the endpoints
- *   CAPTURE_WIDTH        default 1280
- *   CAPTURE_HEIGHT       default 720
+ *   CAPTURE_WIDTH        default 1920
+ *   CAPTURE_HEIGHT       default 1080
  *   CAPTURE_FPS          default 30 (output mp4 fps)
  */
 
@@ -35,8 +35,8 @@ import path from 'node:path'
 
 const PORT = process.env.PORT || 8080
 const TOKEN = process.env.CAPTURE_TOKEN
-const WIDTH = Number(process.env.CAPTURE_WIDTH || 1280)
-const HEIGHT = Number(process.env.CAPTURE_HEIGHT || 720)
+const WIDTH = Number(process.env.CAPTURE_WIDTH || 1920)
+const HEIGHT = Number(process.env.CAPTURE_HEIGHT || 1080)
 const FPS = Number(process.env.CAPTURE_FPS || 30)
 
 // Where finished MP4s live. Railway volumes persist across restarts if mounted.
@@ -102,13 +102,14 @@ async function renderCapture({ baseUrl, flowJson, sequenceJson, outPath }) {
   })
 
   try {
-    // Capture at 2x (supersampling): render + record at double resolution, then
-    // downscale to the target size in ffmpeg. This sharpens text and smooths the
-    // dark gradients (banding), since supersampling averages out 8-bit stepping.
+    // Supersampling: render the page at 2x device pixels (deviceScaleFactor)
+    // but record the video at the OUTPUT resolution. Chromium downsamples the
+    // 2x backing store into each video frame → crisp text + smooth gradients,
+    // without producing a heavy 4K intermediate that could OOM the container.
     const context = await browser.newContext({
       viewport: { width: WIDTH, height: HEIGHT },
       deviceScaleFactor: 2,
-      recordVideo: { dir: videoDir, size: { width: WIDTH * 2, height: HEIGHT * 2 } },
+      recordVideo: { dir: videoDir, size: { width: WIDTH, height: HEIGHT } },
     })
 
     // Inject the payload BEFORE any page script runs.
@@ -169,18 +170,14 @@ async function findNewestWebm(dir) {
 
 function transcodeToMp4(input, output) {
   return new Promise((resolve, reject) => {
-    // Downscale the 2x recording to the target size with lanczos (sharp text),
-    // then dither while converting to 8-bit yuv420p to kill gradient banding.
-    const vf = [
-      `scale=${WIDTH}:${HEIGHT}:flags=lanczos`,
-      'format=yuv420p',
-    ].join(',')
+    // The webm is already at output resolution (supersampled by the browser).
+    // Just dither into 8-bit yuv420p to kill any residual gradient banding and
+    // encode at high quality. No scaling needed.
     const args = [
       '-y',
       '-i', input,
       '-r', String(FPS),
-      '-vf', vf,
-      '-sws_dither', 'ed', // error-diffusion dithering on the scale step
+      '-vf', 'format=yuv420p',
       '-c:v', 'libx264',
       '-preset', 'slow',
       '-crf', '16',
