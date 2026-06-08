@@ -1,5 +1,27 @@
 /**
  * Nemo capture worker — pixel-perfect MP4 via real-page screen recording.
+ *
+ * Instead of re-implementing the scene (Remotion), this opens the deployed
+ * `/capture` page in headless Chromium and records the actual React Flow
+ * canvas with Playwright's native video recorder. The result is byte-for-byte
+ * the same visuals as the in-app editor, because it IS the in-app page.
+ *
+ * Flow:
+ *   1. POST /render  { baseUrl, flowJson, sequenceJson? }
+ *        → launches a browser context with `recordVideo`
+ *        → injects the payload into sessionStorage before navigation
+ *        → navigates to `${baseUrl}/capture`
+ *        → waits for window.__nemoCaptureReady, then window.__nemoCaptureDone
+ *        → closes the context (flushes the .webm), transcodes to .mp4
+ *        → returns { fileName }
+ *   2. GET /download/:fileName  → the MP4 (404 until ready, 200 once done)
+ *
+ * Env:
+ *   PORT                 (Railway sets this automatically)
+ *   CAPTURE_TOKEN        (optional) bearer token to protect the endpoints
+ *   CAPTURE_WIDTH        default 1280
+ *   CAPTURE_HEIGHT       default 720
+ *   CAPTURE_FPS          default 30 (output mp4 fps)
  */
 
 import express from 'express'
@@ -17,11 +39,13 @@ const WIDTH = Number(process.env.CAPTURE_WIDTH || 1280)
 const HEIGHT = Number(process.env.CAPTURE_HEIGHT || 720)
 const FPS = Number(process.env.CAPTURE_FPS || 30)
 
+// Where finished MP4s live. Railway volumes persist across restarts if mounted.
 const OUTPUT_DIR = process.env.CAPTURE_OUTPUT_DIR || path.join(tmpdir(), 'nemo-captures')
 
 const app = express()
 app.use(express.json({ limit: '25mb' }))
 
+// ── Simple bearer auth (optional) ────────────────────────────────────────────
 app.use((req, res, next) => {
   if (!TOKEN) return next()
   const auth = req.headers.authorization || ''
@@ -31,13 +55,17 @@ app.use((req, res, next) => {
 
 app.get('/health', (_req, res) => res.json({ ok: true }))
 
+// ── POST /render ─────────────────────────────────────────────────────────────
 app.post('/render', async (req, res) => {
   const { baseUrl, flowJson, sequenceJson } = req.body || {}
   if (!baseUrl || !flowJson) {
     return res.status(400).json({ error: 'Missing baseUrl or flowJson' })
   }
+
   const fileName = `nemo-${Date.now()}.mp4`
   const outPath = path.join(OUTPUT_DIR, fileName)
+
+  // Respond after the render completes (the app polls /download as a fallback).
   try {
     await renderCapture({ baseUrl, flowJson, sequenceJson, outPath })
     return res.json({ fileName })
@@ -47,6 +75,7 @@ app.post('/render', async (req, res) => {
   }
 })
 
+// ── GET /download/:fileName ──────────────────────────────────────────────────
 app.get('/download/:fileName', async (req, res) => {
   const fileName = path.basename(req.params.fileName)
   const filePath = path.join(OUTPUT_DIR, fileName)
@@ -56,6 +85,7 @@ app.get('/download/:fileName', async (req, res) => {
   res.sendFile(filePath)
 })
 
+// ── Core: open /capture, record video, transcode to mp4 ──────────────────────
 async function renderCapture({ baseUrl, flowJson, sequenceJson, outPath }) {
   const { mkdir } = await import('node:fs/promises')
   await mkdir(OUTPUT_DIR, { recursive: true })
@@ -67,17 +97,21 @@ async function renderCapture({ baseUrl, flowJson, sequenceJson, outPath }) {
       '--no-sandbox',
       '--disable-dev-shm-usage',
       '--disable-frame-rate-limit',
-      '--force-device-scale-factor=1',
+      '--force-device-scale-factor=2',
     ],
   })
 
   try {
+    // Capture at 2x (supersampling): render + record at double resolution, then
+    // downscale to the target size in ffmpeg. This sharpens text and smooths the
+    // dark gradients (banding), since supersampling averages out 8-bit stepping.
     const context = await browser.newContext({
       viewport: { width: WIDTH, height: HEIGHT },
-      deviceScaleFactor: 1,
-      recordVideo: { dir: videoDir, size: { width: WIDTH, height: HEIGHT } },
+      deviceScaleFactor: 2,
+      recordVideo: { dir: videoDir, size: { width: WIDTH * 2, height: HEIGHT * 2 } },
     })
 
+    // Inject the payload BEFORE any page script runs.
     await context.addInitScript(
       ({ flow, seq }) => {
         sessionStorage.setItem('nemo_capture_flow', flow)
@@ -88,19 +122,23 @@ async function renderCapture({ baseUrl, flowJson, sequenceJson, outPath }) {
 
     const page = await context.newPage()
     const url = `${baseUrl.replace(/\/$/, '')}/capture`
-    await page.goto(url, { waitUntil: 'networkidle', timeout: 45000 })
+    await page.goto(url, { waitUntil: 'networkidle', timeout: 45_000 })
 
+    // Bail early if the page reported a fatal error.
     const captureError = await page.evaluate(() => window.__nemoCaptureError || null)
     if (captureError) throw new Error(`Capture page error: ${captureError}`)
 
-    await page.waitForFunction(() => window.__nemoCaptureReady === true, { timeout: 30000 })
+    // Wait for the scene to mount and signal readiness.
+    await page.waitForFunction(() => window.__nemoCaptureReady === true, { timeout: 30_000 })
 
-    const durationMs = await page.evaluate(() => window.__nemoCaptureDurationMs || 20000)
+    const durationMs = await page.evaluate(() => window.__nemoCaptureDurationMs || 20_000)
 
+    // Wait for playback to finish (duration + safety margin).
     await page.waitForFunction(() => window.__nemoCaptureDone === true, {
-      timeout: durationMs + 15000,
+      timeout: durationMs + 15_000,
     })
 
+    // Closing the context flushes and finalizes the .webm file.
     await context.close()
 
     const webmPath = await findNewestWebm(videoDir)
@@ -131,13 +169,22 @@ async function findNewestWebm(dir) {
 
 function transcodeToMp4(input, output) {
   return new Promise((resolve, reject) => {
+    // Downscale the 2x recording to the target size with lanczos (sharp text),
+    // then dither while converting to 8-bit yuv420p to kill gradient banding.
+    const vf = [
+      `scale=${WIDTH}:${HEIGHT}:flags=lanczos`,
+      'format=yuv420p',
+    ].join(',')
     const args = [
       '-y',
       '-i', input,
       '-r', String(FPS),
+      '-vf', vf,
+      '-sws_dither', 'ed', // error-diffusion dithering on the scale step
       '-c:v', 'libx264',
-      '-preset', 'fast',
-      '-crf', '18',
+      '-preset', 'slow',
+      '-crf', '16',
+      '-tune', 'animation', // better for flat-color UI / gradients than default
       '-pix_fmt', 'yuv420p',
       '-movflags', '+faststart',
       output,
