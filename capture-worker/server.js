@@ -20,8 +20,6 @@ const DEFAULT_BASE_URL = process.env.CAPTURE_BASE_URL || ''
 const OUTPUT_DIR = process.env.CAPTURE_OUTPUT_DIR || path.join(tmpdir(), 'nemo-captures')
 
 // ── Logging helpers ────────────────────────────────────────────────────────
-// Each render gets a short id so you can grep one run's logs out of a busy
-// server. Every log line is prefixed with [capture:<id>] <elapsedMs>ms.
 let __renderCounter = 0
 function makeLogger(prefix) {
   const start = Date.now()
@@ -44,17 +42,21 @@ console.log('[capture] WIDTH x HEIGHT =', WIDTH, 'x', HEIGHT)
 console.log('[capture] FPS            =', FPS)
 console.log('[capture] SCALE          =', SCALE)
 console.log('[capture] CRF            =', CRF)
-console.log('[capture] DEFAULT_BASE_URL =', DEFAULT_BASE_URL || '(none — baseUrl/url required per request)')
+console.log('[capture] DEFAULT_BASE_URL =', DEFAULT_BASE_URL || '(none — baseUrl required per request)')
 console.log('[capture] OUTPUT_DIR     =', OUTPUT_DIR)
 console.log('[capture] ffmpegPath     =', ffmpegPath)
 console.log('========================================')
 
 const app = express()
-app.use(express.json({ limit: '2mb' })) // payload is tiny now — just ids + params
+app.use(express.json({ limit: '2mb' }))
 
 // Log every incoming request at the top, before auth/routing.
 app.use((req, _res, next) => {
-  console.log(`[http] ${new Date().toISOString()} ${req.method} ${req.originalUrl} body=${JSON.stringify(req.body || {})}`)
+  // Don't dump the raw token to logs in full — show a truncated version so
+  // you can still match it to a job without leaking the whole secret.
+  const safeBody = { ...(req.body || {}) }
+  if (safeBody.token) safeBody.token = `${String(safeBody.token).slice(0, 8)}...`
+  console.log(`[http] ${new Date().toISOString()} ${req.method} ${req.originalUrl} body=${JSON.stringify(safeBody)}`)
   next()
 })
 
@@ -78,11 +80,21 @@ app.get('/health', (_req, res) => {
   res.json({ ok: true })
 })
 
-// ── Build the public /capture URL the page expects ────────────────────────────
-// The page is self-contained: it loads the flow from /api/public/flow using
-// projectId + flowId, applies `theme`, and exposes the __nemoCapture* flags.
-function buildCaptureUrl({ baseUrl, url, projectId, flowId, seq, theme, duration }, log) {
-  log.log('buildCaptureUrl() input =', { baseUrl, url, projectId, flowId, seq, theme, duration })
+// ── Build the /capture URL the page expects ───────────────────────────────────
+// THE APP'S REAL CONTRACT (confirmed by reading /api/render-capture):
+//   POST /render { baseUrl, jobId, token }
+// The /capture page loads the flow + sequence from the DB via the time-limited
+// job token — projectId/flowId are NEVER part of this path. The job route
+// builds: ${baseUrl}/capture?jobId=<jobId>&token=<token>
+//
+// We still accept { url } (a full public/job link, verbatim) and
+// { projectId, flowId, seq, theme, duration } as a secondary convenience for
+// manual/public-link testing, but jobId+token is the PRIMARY, expected path.
+function buildCaptureUrl({ baseUrl, url, jobId, token, projectId, flowId, seq, theme, duration }, log) {
+  log.log('buildCaptureUrl() input =', {
+    baseUrl, url, jobId, token: token ? `${String(token).slice(0, 8)}...` : token,
+    projectId, flowId, seq, theme, duration,
+  })
 
   if (url) {
     log.log('buildCaptureUrl() → caller passed full url verbatim:', url)
@@ -96,19 +108,28 @@ function buildCaptureUrl({ baseUrl, url, projectId, flowId, seq, theme, duration
     log.error('buildCaptureUrl() → Missing baseUrl AND no CAPTURE_BASE_URL set')
     throw new Error('Missing baseUrl (and no CAPTURE_BASE_URL set)')
   }
-  if (!projectId || !flowId) {
-    log.error('buildCaptureUrl() → Missing projectId or flowId. projectId=', projectId, 'flowId=', flowId)
-    throw new Error('Missing projectId or flowId')
+
+  // ── PRIMARY PATH: secure render job (this is what "Render MP4" sends) ──────
+  if (jobId && token) {
+    const qs = new URLSearchParams({ jobId, token })
+    const finalUrl = `${origin}/capture?${qs.toString()}`
+    log.log('buildCaptureUrl() → using PRIMARY job path (jobId/token). Built URL:', finalUrl.replace(token, `${token.slice(0, 8)}...`))
+    return finalUrl
   }
 
-  const qs = new URLSearchParams({ projectId, flowId })
-  if (seq)      qs.set('seq', seq)
-  if (theme)    qs.set('theme', theme)
-  if (duration) qs.set('duration', String(duration))
+  // ── FALLBACK PATH: public link by ids (manual testing / public share link) ─
+  if (projectId && flowId) {
+    const qs = new URLSearchParams({ projectId, flowId })
+    if (seq)      qs.set('seq', seq)
+    if (theme)    qs.set('theme', theme)
+    if (duration) qs.set('duration', String(duration))
+    const finalUrl = `${origin}/capture?${qs.toString()}`
+    log.log('buildCaptureUrl() → using FALLBACK public-link path (projectId/flowId). Built URL:', finalUrl)
+    return finalUrl
+  }
 
-  const finalUrl = `${origin}/capture?${qs.toString()}`
-  log.log('buildCaptureUrl() → built URL:', finalUrl)
-  return finalUrl
+  log.error('buildCaptureUrl() → Missing jobId/token (and no projectId/flowId, and no url)')
+  throw new Error('Missing jobId/token (or projectId/flowId, or url)')
 }
 
 // ── POST /render — kick off a background render, return the fileName now ──────
@@ -117,13 +138,15 @@ app.post('/render', async (req, res) => {
   const renderId = `r${__renderCounter}-${Date.now()}`
   const log = makeLogger(renderId)
 
-  log.log('POST /render received. body =', JSON.stringify(req.body))
+  const safeBody = { ...(req.body || {}) }
+  if (safeBody.token) safeBody.token = `${String(safeBody.token).slice(0, 8)}...`
+  log.log('POST /render received. body =', JSON.stringify(safeBody))
 
-  const { baseUrl, url, projectId, flowId, seq, theme, duration } = req.body || {}
+  const { baseUrl, url, jobId, token, projectId, flowId, seq, theme, duration } = req.body || {}
 
   let captureUrl
   try {
-    captureUrl = buildCaptureUrl({ baseUrl, url, projectId, flowId, seq, theme, duration }, log)
+    captureUrl = buildCaptureUrl({ baseUrl, url, jobId, token, projectId, flowId, seq, theme, duration }, log)
   } catch (err) {
     log.error('buildCaptureUrl failed:', err.message)
     return res.status(400).json({ error: err.message })
@@ -134,7 +157,6 @@ app.post('/render', async (req, res) => {
 
   log.log('fileName =', fileName)
   log.log('outPath  =', outPath)
-  log.log('captureUrl =', captureUrl)
   log.log('Kicking off renderCapture() in background...')
 
   // Render in the background; the app polls GET /download/:fileName.
@@ -154,7 +176,7 @@ app.post('/render', async (req, res) => {
     })
 
   log.log('Responding 202 to caller immediately (render continues async)')
-  return res.status(202).json({ fileName, captureUrl })
+  return res.status(202).json({ fileName })
 })
 
 // ── GET /download/:fileName ──────────────────────────────────────────────────
@@ -205,7 +227,6 @@ async function renderCapture({ captureUrl, fallbackDurationMs, outPath, log }) {
   })
   log.log(`Chromium launched in ${Date.now() - browserLaunchStart}ms`)
 
-  // Surface low-level browser process issues that often explain silent hangs.
   browser.on('disconnected', () => log.error('Browser DISCONNECTED unexpectedly'))
 
   try {
@@ -225,9 +246,7 @@ async function renderCapture({ captureUrl, fallbackDurationMs, outPath, log }) {
     const page = await context.newPage()
     log.log('Page created')
 
-    // Pipe ALL browser-side console output back to our logs — this is usually
-    // where the real reason for a hang/error lives (app-level errors,
-    // failed fetches to /api/public/flow, etc.)
+    // Pipe ALL browser-side console output back to our logs.
     page.on('console', (msg) => {
       log.log(`[page console:${msg.type()}]`, msg.text())
     })
@@ -274,7 +293,8 @@ async function renderCapture({ captureUrl, fallbackDurationMs, outPath, log }) {
     log.log('Checking window.__nemoCaptureError ...')
     const captureError = await page.evaluate(() => window.__nemoCaptureError || null)
     if (captureError) {
-      log.error('Page reported __nemoCaptureError:', captureError)
+      // Most common real-world cause here: expired/invalid job token.
+      log.error('Page reported __nemoCaptureError:', captureError, '(check: expired or invalid jobId/token?)')
       throw new Error(`Capture page error: ${captureError}`)
     }
     log.log('No __nemoCaptureError reported (yet)')
@@ -286,7 +306,6 @@ async function renderCapture({ captureUrl, fallbackDurationMs, outPath, log }) {
       log.log(`__nemoCaptureReady became true after ${Date.now() - readyStart}ms`)
     } catch (readyErr) {
       log.error(`Timed out waiting for __nemoCaptureReady after ${Date.now() - readyStart}ms:`, readyErr.message)
-      // Dump diagnostic state from the page before giving up.
       try {
         const diag = await page.evaluate(() => ({
           ready: window.__nemoCaptureReady,
@@ -300,10 +319,9 @@ async function renderCapture({ captureUrl, fallbackDurationMs, outPath, log }) {
       } catch (diagErr) {
         log.error('Could not even evaluate diagnostic state:', diagErr.message)
       }
-      // Also grab a screenshot to help debug visually, even though we'll abort.
       try {
         const debugPng = await page.screenshot({ type: 'png' })
-        log.error('Captured a debug screenshot at timeout, size =', debugPng.length, 'bytes (not saved to disk, just confirming render works)')
+        log.error('Captured a debug screenshot at timeout, size =', debugPng.length, 'bytes')
       } catch (shotErr) {
         log.error('Could not even take a debug screenshot:', shotErr.message)
       }
@@ -352,8 +370,6 @@ async function renderCapture({ captureUrl, fallbackDurationMs, outPath, log }) {
       const png = await page.screenshot({ type: 'png' })
       const frameElapsed = Date.now() - frameStart
 
-      // Log every frame at low volume; log more verbosely every ~30 frames
-      // or if a single frame took unusually long (possible hang indicator).
       if (i % 30 === 0 || frameElapsed > 500) {
         log.log(`  frame ${i + 1}/${totalFrames} | targetMs=${targetMs} | screenshot took ${frameElapsed}ms | bytes=${png.length}`)
       }
@@ -369,8 +385,6 @@ async function renderCapture({ captureUrl, fallbackDurationMs, outPath, log }) {
         log.log(`  drained after ${Date.now() - drainStart}ms`)
       }
 
-      // Periodic heartbeat so you can see the loop is alive even with sparse
-      // per-frame logging.
       if (Date.now() - lastLogAt > 5000) {
         log.log(`  ...heartbeat: frame ${i + 1}/${totalFrames}, elapsed ${Date.now() - loopStart}ms total`)
         lastLogAt = Date.now()
@@ -405,12 +419,11 @@ function spawnFfmpeg(output, log) {
     '-f', 'image2pipe',
     '-framerate', String(FPS),
     '-i', 'pipe:0',
-    // Downscale the supersampled frames to output size, then 8-bit yuv420p.
     '-vf', `scale=${WIDTH}:${HEIGHT}:flags=lanczos,format=yuv420p`,
     '-c:v', 'libx264',
     '-preset', 'slow',
     '-crf', CRF,
-    '-tune', 'animation', // flat-color UI / gradients
+    '-tune', 'animation',
     '-pix_fmt', 'yuv420p',
     '-movflags', '+faststart',
     output,
@@ -425,12 +438,9 @@ function spawnFfmpeg(output, log) {
   ff.stderr.on('data', (d) => {
     const chunk = d.toString()
     stderr += chunk
-    // ffmpeg writes its progress/info to stderr by default — log it so you
-    // can see encoding progress and any warnings/errors live.
     log.log('[ffmpeg stderr]', chunk.trim())
   })
   ff.stdin.on('error', (err) => {
-    // Common cause: writing to stdin after ffmpeg already exited/crashed.
     log.error('ffmpeg stdin error:', err.message)
   })
 
