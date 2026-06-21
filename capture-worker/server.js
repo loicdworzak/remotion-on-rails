@@ -1,51 +1,55 @@
 /**
- * Nemo capture worker — pixel-perfect MP4 via real-page screen recording.
+ * Nemo capture worker — pixel-perfect MP4 via FRAME-BY-FRAME capture of the
+ * real page (no scene re-implementation, no real-time recording).
  *
- * Instead of re-implementing the scene (Remotion), this opens the deployed
- * `/capture` page in headless Chromium and records the actual React Flow
- * canvas with Playwright's native video recorder. The result is byte-for-byte
- * the same visuals as the in-app editor, because it IS the in-app page.
+ * Why frame-by-frame instead of recordVideo:
+ *   - recordVideo encodes VP8/WebM in real time, with lossy compression BEFORE
+ *     ffmpeg ever sees it → banding + artifacts that can't be recovered.
+ *   - Here we open the REAL /capture page, install a VIRTUAL CLOCK, and step it
+ *     one frame at a time. Each step deterministically advances the rAF
+ *     playback loop AND the React Flow camera (fitView) transitions, so we can
+ *     take a LOSSLESS PNG screenshot of each frame and pipe it straight into
+ *     ffmpeg. Result: real page style (it IS the page) + zero compression
+ *     artifacts + perfectly smooth motion regardless of container speed.
  *
  * Flow:
- *   1. POST /render  { baseUrl, flowJson, sequenceJson? }
- *        → launches a browser context with `recordVideo`
- *        → injects the payload into sessionStorage before navigation
- *        → navigates to `${baseUrl}/capture`
- *        → waits for window.__nemoCaptureReady, then window.__nemoCaptureDone
- *        → closes the context (flushes the .webm), transcodes to .mp4
- *        → returns { fileName }
- *   2. GET /download/:fileName  → the MP4 (404 until ready, 200 once done)
+ *   1. POST /render { baseUrl, flowJson, sequenceJson? } → { fileName } (202)
+ *        renders in the BACKGROUND; the app polls /download.
+ *   2. GET /download/:fileName → the MP4 (404 until ready, 200 once done)
  *
  * Env:
  *   PORT                 (Railway sets this automatically)
  *   CAPTURE_TOKEN        (optional) bearer token to protect the endpoints
- *   CAPTURE_WIDTH        default 1920
- *   CAPTURE_HEIGHT       default 1080
- *   CAPTURE_FPS          default 30 (output mp4 fps)
+ *   CAPTURE_WIDTH        default 1920   (output width)
+ *   CAPTURE_HEIGHT       default 1080   (output height)
+ *   CAPTURE_FPS          default 30
+ *   CAPTURE_SCALE        default 2      (supersampling: render at N× then downscale)
+ *   CAPTURE_CRF          default 16     (lower = higher quality / bigger file)
  */
 
 import express from 'express'
 import { chromium } from 'playwright'
 import ffmpegPath from 'ffmpeg-static'
 import { spawn } from 'node:child_process'
-import { mkdtemp, rm, readdir, stat } from 'node:fs/promises'
+import { mkdir } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
-const PORT = process.env.PORT || 8080
-const TOKEN = process.env.CAPTURE_TOKEN
-const WIDTH = Number(process.env.CAPTURE_WIDTH || 1920)
+const PORT   = process.env.PORT || 8080
+const TOKEN  = process.env.CAPTURE_TOKEN
+const WIDTH  = Number(process.env.CAPTURE_WIDTH || 1920)
 const HEIGHT = Number(process.env.CAPTURE_HEIGHT || 1080)
-const FPS = Number(process.env.CAPTURE_FPS || 30)
+const FPS    = Number(process.env.CAPTURE_FPS || 30)
+const SCALE  = Number(process.env.CAPTURE_SCALE || 2)
+const CRF    = String(process.env.CAPTURE_CRF || 16)
 
-// Where finished MP4s live. Railway volumes persist across restarts if mounted.
 const OUTPUT_DIR = process.env.CAPTURE_OUTPUT_DIR || path.join(tmpdir(), 'nemo-captures')
 
 const app = express()
 app.use(express.json({ limit: '25mb' }))
 
-// ── Simple bearer auth (optional) ────────────────────────────────────────────
+// ── Optional bearer auth ──────────────────────────────────────────────────────
 app.use((req, res, next) => {
   if (!TOKEN) return next()
   const auth = req.headers.authorization || ''
@@ -55,7 +59,7 @@ app.use((req, res, next) => {
 
 app.get('/health', (_req, res) => res.json({ ok: true }))
 
-// ── POST /render ─────────────────────────────────────────────────────────────
+// ── POST /render — kick off a background render, return the fileName now ──────
 app.post('/render', async (req, res) => {
   const { baseUrl, flowJson, sequenceJson } = req.body || {}
   if (!baseUrl || !flowJson) {
@@ -63,16 +67,14 @@ app.post('/render', async (req, res) => {
   }
 
   const fileName = `nemo-${Date.now()}.mp4`
-  const outPath = path.join(OUTPUT_DIR, fileName)
+  const outPath  = path.join(OUTPUT_DIR, fileName)
 
-  // Respond after the render completes (the app polls /download as a fallback).
-  try {
-    await renderCapture({ baseUrl, flowJson, sequenceJson, outPath })
-    return res.json({ fileName })
-  } catch (err) {
-    console.error('[capture] render failed:', err)
-    return res.status(500).json({ error: err?.message || String(err) })
-  }
+  // Render in the background; the app polls GET /download/:fileName.
+  renderCapture({ baseUrl, flowJson, sequenceJson, outPath }).catch((err) => {
+    console.error('[capture] render failed:', err?.message || err)
+  })
+
+  return res.status(202).json({ fileName })
 })
 
 // ── GET /download/:fileName ──────────────────────────────────────────────────
@@ -85,119 +87,114 @@ app.get('/download/:fileName', async (req, res) => {
   res.sendFile(filePath)
 })
 
-// ── Core: open /capture, record video, transcode to mp4 ──────────────────────
+// ── Core: frame-by-frame capture of the real /capture page ───────────────────
 async function renderCapture({ baseUrl, flowJson, sequenceJson, outPath }) {
-  const { mkdir } = await import('node:fs/promises')
   await mkdir(OUTPUT_DIR, { recursive: true })
-  const videoDir = await mkdtemp(path.join(tmpdir(), 'nemo-vid-'))
 
   const browser = await chromium.launch({
     headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-frame-rate-limit',
-      '--force-device-scale-factor=2',
-    ],
+    args: ['--no-sandbox', '--disable-dev-shm-usage', '--hide-scrollbars'],
   })
 
   try {
-    // Supersampling: render the page at 2x device pixels (deviceScaleFactor)
-    // but record the video at the OUTPUT resolution. Chromium downsamples the
-    // 2x backing store into each video frame → crisp text + smooth gradients,
-    // without producing a heavy 4K intermediate that could OOM the container.
+    // Supersample: render the page at SCALE× device pixels, then downscale in
+    // ffmpeg → crisp text + smooth gradients.
     const context = await browser.newContext({
       viewport: { width: WIDTH, height: HEIGHT },
-      deviceScaleFactor: 2,
-      recordVideo: { dir: videoDir, size: { width: WIDTH, height: HEIGHT } },
+      deviceScaleFactor: SCALE,
     })
 
-    // Inject the payload BEFORE any page script runs.
+    // Inject the payload and flag driven-mode BEFORE any page script runs, so
+    // the /capture page does NOT auto-play (we drive it under the clock).
     await context.addInitScript(
       ({ flow, seq }) => {
         sessionStorage.setItem('nemo_capture_flow', flow)
         if (seq) sessionStorage.setItem('nemo_capture_sequence', seq)
+        window.__nemoCaptureDriven = true
       },
       { flow: flowJson, seq: sequenceJson || null },
     )
 
     const page = await context.newPage()
-    const url = `${baseUrl.replace(/\/$/, '')}/capture`
-    await page.goto(url, { waitUntil: 'networkidle', timeout: 45_000 })
 
-    // Bail early if the page reported a fatal error.
+    // Virtual clock: controls Date, setTimeout, setInterval, performance.now()
+    // and requestAnimationFrame. Advancing it steps the playback loop AND the
+    // camera transitions deterministically, one frame at a time.
+    await page.clock.install({ time: 0 })
+
+    const url = `${baseUrl.replace(/\/$/, '')}/capture`
+    await page.goto(url, { waitUntil: 'load', timeout: 45_000 })
+
     const captureError = await page.evaluate(() => window.__nemoCaptureError || null)
     if (captureError) throw new Error(`Capture page error: ${captureError}`)
 
-    // Wait for the scene to mount and signal readiness.
+    // Let the scene mount + fire its settle timer (sets ready). Driven mode
+    // means it will NOT auto-play.
+    await page.clock.runFor(1300)
     await page.waitForFunction(() => window.__nemoCaptureReady === true, { timeout: 30_000 })
 
-    const durationMs = await page.evaluate(() => window.__nemoCaptureDurationMs || 20_000)
+    const durationMs  = await page.evaluate(() => window.__nemoCaptureDurationMs || 20_000)
+    const frameMs     = 1000 / FPS
+    const totalFrames = Math.round((durationMs / 1000) * FPS) + 1
 
-    // Wait for playback to finish (duration + safety margin).
-    await page.waitForFunction(() => window.__nemoCaptureDone === true, {
-      timeout: durationMs + 15_000,
-    })
+    // Start playback (seek 0 + play) — schedules the first rAF tick.
+    await page.evaluate(() => window.__nemoCaptureStart && window.__nemoCaptureStart())
 
-    // Closing the context flushes and finalizes the .webm file.
-    await context.close()
+    const ff = spawnFfmpeg(outPath)
 
-    const webmPath = await findNewestWebm(videoDir)
-    if (!webmPath) throw new Error('No video file was produced by Playwright')
+    let advancedMs = 0
+    for (let i = 0; i < totalFrames; i++) {
+      // Advance the clock to this frame's timestamp using integer steps to
+      // avoid sub-ms drift, then fire the pending rAF tick.
+      const targetMs = Math.round(i * frameMs)
+      const step = targetMs - advancedMs
+      advancedMs = targetMs
+      if (step > 0) await page.clock.runFor(step)
 
-    await transcodeToMp4(webmPath, outPath)
+      const png = await page.screenshot({ type: 'png' })
+      if (!ff.stdin.write(png)) {
+        await new Promise((resolve) => ff.stdin.once('drain', resolve))
+      }
+    }
+
+    ff.stdin.end()
+    await ff.done
   } finally {
     await browser.close().catch(() => {})
-    await rm(videoDir, { recursive: true, force: true }).catch(() => {})
   }
 }
 
-async function findNewestWebm(dir) {
-  const files = (await readdir(dir)).filter((f) => f.endsWith('.webm'))
-  if (files.length === 0) return null
-  let newest = null
-  let newestMtime = 0
-  for (const f of files) {
-    const full = path.join(dir, f)
-    const s = await stat(full)
-    if (s.mtimeMs >= newestMtime) {
-      newestMtime = s.mtimeMs
-      newest = full
-    }
-  }
-  return newest
-}
-
-function transcodeToMp4(input, output) {
-  return new Promise((resolve, reject) => {
-    // The webm is already at output resolution (supersampled by the browser).
-    // Just dither into 8-bit yuv420p to kill any residual gradient banding and
-    // encode at high quality. No scaling needed.
-    const args = [
-      '-y',
-      '-i', input,
-      '-r', String(FPS),
-      '-vf', 'format=yuv420p',
-      '-c:v', 'libx264',
-      '-preset', 'slow',
-      '-crf', '16',
-      '-tune', 'animation', // better for flat-color UI / gradients than default
-      '-pix_fmt', 'yuv420p',
-      '-movflags', '+faststart',
-      output,
-    ]
-    const ff = spawn(ffmpegPath, args)
-    let stderr = ''
-    ff.stderr.on('data', (d) => { stderr += d.toString() })
+// ── ffmpeg: assemble a stream of PNG frames (stdin) into an H.264 MP4 ─────────
+function spawnFfmpeg(output) {
+  const args = [
+    '-y',
+    '-f', 'image2pipe',
+    '-framerate', String(FPS),
+    '-i', 'pipe:0',
+    // Downscale the supersampled frames to output size, then 8-bit yuv420p.
+    '-vf', `scale=${WIDTH}:${HEIGHT}:flags=lanczos,format=yuv420p`,
+    '-c:v', 'libx264',
+    '-preset', 'slow',
+    '-crf', CRF,
+    '-tune', 'animation', // flat-color UI / gradients
+    '-pix_fmt', 'yuv420p',
+    '-movflags', '+faststart',
+    output,
+  ]
+  const ff = spawn(ffmpegPath, args)
+  let stderr = ''
+  ff.stderr.on('data', (d) => { stderr += d.toString() })
+  const done = new Promise((resolve, reject) => {
     ff.on('error', reject)
     ff.on('close', (code) => {
       if (code === 0) resolve(output)
-      else reject(new Error(`ffmpeg exited with ${code}: ${stderr.slice(-500)}`))
+      else reject(new Error(`ffmpeg exited with ${code}: ${stderr.slice(-800)}`))
     })
   })
+  return { stdin: ff.stdin, done }
 }
 
 app.listen(PORT, () => {
-  console.log(`[capture] worker listening on :${PORT}`)
-  console.log(`[capture] output dir: ${OUTPUT_DIR}`)
+  console.log(`[capture] frame-by-frame worker listening on :${PORT}`)
+  console.log(`[capture] output dir: ${OUTPUT_DIR} | ${WIDTH}x${HEIGHT}@${FPS} scale=${SCALE} crf=${CRF}`)
 })
