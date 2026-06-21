@@ -1,32 +1,3 @@
-/**
- * Nemo capture worker — pixel-perfect MP4 via FRAME-BY-FRAME capture of the
- * real page (no scene re-implementation, no real-time recording).
- *
- * Why frame-by-frame instead of recordVideo:
- *   - recordVideo encodes VP8/WebM in real time, with lossy compression BEFORE
- *     ffmpeg ever sees it → banding + artifacts that can't be recovered.
- *   - Here we open the REAL /capture page, install a VIRTUAL CLOCK, and step it
- *     one frame at a time. Each step deterministically advances the rAF
- *     playback loop AND the React Flow camera (fitView) transitions, so we can
- *     take a LOSSLESS PNG screenshot of each frame and pipe it straight into
- *     ffmpeg. Result: real page style (it IS the page) + zero compression
- *     artifacts + perfectly smooth motion regardless of container speed.
- *
- * Flow:
- *   1. POST /render { baseUrl, flowJson, sequenceJson? } → { fileName } (202)
- *        renders in the BACKGROUND; the app polls /download.
- *   2. GET /download/:fileName → the MP4 (404 until ready, 200 once done)
- *
- * Env:
- *   PORT                 (Railway sets this automatically)
- *   CAPTURE_TOKEN        (optional) bearer token to protect the endpoints
- *   CAPTURE_WIDTH        default 1920   (output width)
- *   CAPTURE_HEIGHT       default 1080   (output height)
- *   CAPTURE_FPS          default 30
- *   CAPTURE_SCALE        default 2      (supersampling: render at N× then downscale)
- *   CAPTURE_CRF          default 16     (lower = higher quality / bigger file)
- */
-
 import express from 'express'
 import { chromium } from 'playwright'
 import ffmpegPath from 'ffmpeg-static'
@@ -38,16 +9,18 @@ import path from 'node:path'
 
 const PORT   = process.env.PORT || 8080
 const TOKEN  = process.env.CAPTURE_TOKEN
-const WIDTH  = Number(process.env.CAPTURE_WIDTH || 1920)
+const WIDTH  = Number(process.env.CAPTURE_WIDTH  || 1920)
 const HEIGHT = Number(process.env.CAPTURE_HEIGHT || 1080)
-const FPS    = Number(process.env.CAPTURE_FPS || 30)
-const SCALE  = Number(process.env.CAPTURE_SCALE || 2)
-const CRF    = String(process.env.CAPTURE_CRF || 16)
+const FPS    = Number(process.env.CAPTURE_FPS    || 30)
+const SCALE  = Number(process.env.CAPTURE_SCALE  || 2)
+const CRF    = String(process.env.CAPTURE_CRF    || 16)
 
+// Default app origin so callers can omit baseUrl (e.g. your Vercel deployment).
+const DEFAULT_BASE_URL = process.env.CAPTURE_BASE_URL || ''
 const OUTPUT_DIR = process.env.CAPTURE_OUTPUT_DIR || path.join(tmpdir(), 'nemo-captures')
 
 const app = express()
-app.use(express.json({ limit: '25mb' }))
+app.use(express.json({ limit: '2mb' })) // payload is tiny now — just ids + params
 
 // ── Optional bearer auth ──────────────────────────────────────────────────────
 app.use((req, res, next) => {
@@ -59,22 +32,40 @@ app.use((req, res, next) => {
 
 app.get('/health', (_req, res) => res.json({ ok: true }))
 
+// ── Build the public /capture URL the page expects ────────────────────────────
+// The page is self-contained: it loads the flow from /api/public/flow using
+// projectId + flowId, applies `theme`, and exposes the __nemoCapture* flags.
+function buildCaptureUrl({ baseUrl, url, projectId, flowId, seq, theme, duration }) {
+  if (url) return url // caller passed a full public link verbatim
+  const origin = (baseUrl || DEFAULT_BASE_URL).replace(/\/$/, '')
+  if (!origin) throw new Error('Missing baseUrl (and no CAPTURE_BASE_URL set)')
+  if (!projectId || !flowId) throw new Error('Missing projectId or flowId')
+  const qs = new URLSearchParams({ projectId, flowId })
+  if (seq)      qs.set('seq', seq)
+  if (theme)    qs.set('theme', theme)
+  if (duration) qs.set('duration', String(duration))
+  return `${origin}/capture?${qs.toString()}`
+}
+
 // ── POST /render — kick off a background render, return the fileName now ──────
 app.post('/render', async (req, res) => {
-  const { baseUrl, flowJson, sequenceJson } = req.body || {}
-  if (!baseUrl || !flowJson) {
-    return res.status(400).json({ error: 'Missing baseUrl or flowJson' })
+  const { baseUrl, url, projectId, flowId, seq, theme, duration } = req.body || {}
+
+  let captureUrl
+  try {
+    captureUrl = buildCaptureUrl({ baseUrl, url, projectId, flowId, seq, theme, duration })
+  } catch (err) {
+    return res.status(400).json({ error: err.message })
   }
 
   const fileName = `nemo-${Date.now()}.mp4`
   const outPath  = path.join(OUTPUT_DIR, fileName)
 
   // Render in the background; the app polls GET /download/:fileName.
-  renderCapture({ baseUrl, flowJson, sequenceJson, outPath }).catch((err) => {
-    console.error('[capture] render failed:', err?.message || err)
-  })
+  renderCapture({ captureUrl, fallbackDurationMs: Number(duration) || undefined, outPath })
+    .catch((err) => console.error('[capture] render failed:', err?.message || err))
 
-  return res.status(202).json({ fileName })
+  return res.status(202).json({ fileName, captureUrl })
 })
 
 // ── GET /download/:fileName ──────────────────────────────────────────────────
@@ -88,7 +79,7 @@ app.get('/download/:fileName', async (req, res) => {
 })
 
 // ── Core: frame-by-frame capture of the real /capture page ───────────────────
-async function renderCapture({ baseUrl, flowJson, sequenceJson, outPath }) {
+async function renderCapture({ captureUrl, fallbackDurationMs, outPath }) {
   await mkdir(OUTPUT_DIR, { recursive: true })
 
   const browser = await chromium.launch({
@@ -104,16 +95,12 @@ async function renderCapture({ baseUrl, flowJson, sequenceJson, outPath }) {
       deviceScaleFactor: SCALE,
     })
 
-    // Inject the payload and flag driven-mode BEFORE any page script runs, so
-    // the /capture page does NOT auto-play (we drive it under the clock).
-    await context.addInitScript(
-      ({ flow, seq }) => {
-        sessionStorage.setItem('nemo_capture_flow', flow)
-        if (seq) sessionStorage.setItem('nemo_capture_sequence', seq)
-        window.__nemoCaptureDriven = true
-      },
-      { flow: flowJson, seq: sequenceJson || null },
-    )
+    // Flag driven-mode BEFORE any page script runs, so the /capture page does
+    // NOT auto-play — we drive it under the virtual clock. The flow + sequence
+    // are loaded by the page itself from the URL (no sessionStorage injection).
+    await context.addInitScript(() => {
+      window.__nemoCaptureDriven = true
+    })
 
     const page = await context.newPage()
 
@@ -122,18 +109,23 @@ async function renderCapture({ baseUrl, flowJson, sequenceJson, outPath }) {
     // camera transitions deterministically, one frame at a time.
     await page.clock.install({ time: 0 })
 
-    const url = `${baseUrl.replace(/\/$/, '')}/capture`
-    await page.goto(url, { waitUntil: 'load', timeout: 45_000 })
-
-    const captureError = await page.evaluate(() => window.__nemoCaptureError || null)
-    if (captureError) throw new Error(`Capture page error: ${captureError}`)
+    await page.goto(captureUrl, { waitUntil: 'load', timeout: 45_000 })
 
     // Let the scene mount + fire its settle timer (sets ready). Driven mode
     // means it will NOT auto-play.
     await page.clock.runFor(1300)
+
+    // Fail fast if the page reported a load error (bad ids, no sequence, …).
+    const captureError = await page.evaluate(() => window.__nemoCaptureError || null)
+    if (captureError) throw new Error(`Capture page error: ${captureError}`)
+
     await page.waitForFunction(() => window.__nemoCaptureReady === true, { timeout: 30_000 })
 
-    const durationMs  = await page.evaluate(() => window.__nemoCaptureDurationMs || 20_000)
+    const durationMs =
+      (await page.evaluate(() => window.__nemoCaptureDurationMs)) ||
+      fallbackDurationMs ||
+      20_000
+
     const frameMs     = 1000 / FPS
     const totalFrames = Math.round((durationMs / 1000) * FPS) + 1
 
