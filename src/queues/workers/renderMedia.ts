@@ -25,6 +25,12 @@ const worker = createWorker(queueName, async (job: Job) => {
     composition: composition,
     codec: "h264",
     serveUrl,
+    // ---- QUALITÉ MAX ----
+  imageFormat: "png",   // frames SANS PERTE (clé n°1 : supprime les artefacts JPEG)
+  crf: 14,              // 1=quasi-master/lourd, 18=très bon. 12-16 = sweet spot UI
+  x264Preset: "slower", // meilleure compression à qualité égale
+  scale: 1,             // supersampling : rend en 4K interne puis redescend en 1080p → texte ultra net
+  concurrency: null,    // utilise tous les cœurs CPU dispo
   });
 
   await state.prisma.renders.update({
