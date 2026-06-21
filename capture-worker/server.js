@@ -2,7 +2,7 @@ import express from 'express'
 import { chromium } from 'playwright'
 import ffmpegPath from 'ffmpeg-static'
 import { spawn } from 'node:child_process'
-import { mkdir } from 'node:fs/promises'
+import { mkdir, rename, rm } from 'node:fs/promises'
 import { existsSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -15,132 +15,83 @@ const FPS    = Number(process.env.CAPTURE_FPS    || 30)
 const SCALE  = Number(process.env.CAPTURE_SCALE  || 2)
 const CRF    = String(process.env.CAPTURE_CRF    || 16)
 
-// Default app origin so callers can omit baseUrl (e.g. your Vercel deployment).
 const DEFAULT_BASE_URL = process.env.CAPTURE_BASE_URL || ''
 const OUTPUT_DIR = process.env.CAPTURE_OUTPUT_DIR || path.join(tmpdir(), 'nemo-captures')
+const TMP_DIR = path.join(OUTPUT_DIR, '_tmp')
 
 // ── Logging helpers ────────────────────────────────────────────────────────
 let __renderCounter = 0
 function makeLogger(prefix) {
   const start = Date.now()
-  const id = prefix
   const elapsed = () => `${Date.now() - start}ms`
   return {
-    id,
+    id: prefix,
     start,
-    log: (...args) => console.log(`[capture:${id}] +${elapsed()}`, ...args),
-    warn: (...args) => console.warn(`[capture:${id}] +${elapsed()} ⚠️`, ...args),
-    error: (...args) => console.error(`[capture:${id}] +${elapsed()} ❌`, ...args),
+    log:   (...a) => console.log(`[capture:${prefix}] +${elapsed()}`, ...a),
+    warn:  (...a) => console.warn(`[capture:${prefix}] +${elapsed()} ⚠️`, ...a),
+    error: (...a) => console.error(`[capture:${prefix}] +${elapsed()} ❌`, ...a),
   }
 }
 
 console.log('========================================')
-console.log('[capture] BOOTING capture worker')
-console.log('[capture] PORT           =', PORT)
-console.log('[capture] TOKEN set?     =', Boolean(TOKEN))
-console.log('[capture] WIDTH x HEIGHT =', WIDTH, 'x', HEIGHT)
-console.log('[capture] FPS            =', FPS)
-console.log('[capture] SCALE          =', SCALE)
-console.log('[capture] CRF            =', CRF)
-console.log('[capture] DEFAULT_BASE_URL =', DEFAULT_BASE_URL || '(none — baseUrl required per request)')
-console.log('[capture] OUTPUT_DIR     =', OUTPUT_DIR)
-console.log('[capture] ffmpegPath     =', ffmpegPath)
+console.log('[capture] BOOTING capture worker (3-method comparison build)')
+console.log('[capture] PORT=', PORT, '| WIDTH x HEIGHT=', WIDTH, 'x', HEIGHT, '| FPS=', FPS, '| SCALE=', SCALE, '| CRF=', CRF)
+console.log('[capture] DEFAULT_BASE_URL=', DEFAULT_BASE_URL || '(none)')
+console.log('[capture] OUTPUT_DIR=', OUTPUT_DIR)
 console.log('========================================')
 
 const app = express()
 app.use(express.json({ limit: '2mb' }))
 
-// Log every incoming request at the top, before auth/routing.
 app.use((req, _res, next) => {
-  // Don't dump the raw token to logs in full — show a truncated version so
-  // you can still match it to a job without leaking the whole secret.
   const safeBody = { ...(req.body || {}) }
   if (safeBody.token) safeBody.token = `${String(safeBody.token).slice(0, 8)}...`
   console.log(`[http] ${new Date().toISOString()} ${req.method} ${req.originalUrl} body=${JSON.stringify(safeBody)}`)
   next()
 })
 
-// ── Optional bearer auth ──────────────────────────────────────────────────────
 app.use((req, res, next) => {
-  if (!TOKEN) {
-    console.log('[auth] no CAPTURE_TOKEN configured — skipping auth check')
-    return next()
-  }
+  if (!TOKEN) return next()
   const auth = req.headers.authorization || ''
-  if (auth === `Bearer ${TOKEN}`) {
-    console.log('[auth] OK')
-    return next()
-  }
-  console.warn('[auth] ❌ Unauthorized request — got header:', auth ? `"${auth.slice(0, 12)}..."` : '(none)')
+  if (auth === `Bearer ${TOKEN}`) return next()
+  console.warn('[auth] ❌ Unauthorized')
   res.status(401).json({ error: 'Unauthorized' })
 })
 
-app.get('/health', (_req, res) => {
-  console.log('[health] OK ping')
-  res.json({ ok: true })
-})
+app.get('/health', (_req, res) => res.json({ ok: true }))
 
-// ── Build the /capture URL the page expects ───────────────────────────────────
-// THE APP'S REAL CONTRACT (confirmed by reading /api/render-capture):
-//   POST /render { baseUrl, jobId, token }
-// The /capture page loads the flow + sequence from the DB via the time-limited
-// job token — projectId/flowId are NEVER part of this path. The job route
-// builds: ${baseUrl}/capture?jobId=<jobId>&token=<token>
-//
-// We still accept { url } (a full public/job link, verbatim) and
-// { projectId, flowId, seq, theme, duration } as a secondary convenience for
-// manual/public-link testing, but jobId+token is the PRIMARY, expected path.
+// ── Build the /capture URL ─────────────────────────────────────────────────
+// PRIMARY: { baseUrl, jobId, token } → ${baseUrl}/capture?jobId=...&token=...
+// FALLBACK: { url } verbatim, or { baseUrl, projectId, flowId, ... }
 function buildCaptureUrl({ baseUrl, url, jobId, token, projectId, flowId, seq, theme, duration }, log) {
-  log.log('buildCaptureUrl() input =', {
-    baseUrl, url, jobId, token: token ? `${String(token).slice(0, 8)}...` : token,
-    projectId, flowId, seq, theme, duration,
-  })
-
   if (url) {
-    log.log('buildCaptureUrl() → caller passed full url verbatim:', url)
+    log.log('buildCaptureUrl → url verbatim:', url)
     return url
   }
-
   const origin = (baseUrl || DEFAULT_BASE_URL).replace(/\/$/, '')
-  log.log('buildCaptureUrl() resolved origin =', origin || '(EMPTY)')
+  if (!origin) throw new Error('Missing baseUrl (and no CAPTURE_BASE_URL set)')
 
-  if (!origin) {
-    log.error('buildCaptureUrl() → Missing baseUrl AND no CAPTURE_BASE_URL set')
-    throw new Error('Missing baseUrl (and no CAPTURE_BASE_URL set)')
-  }
-
-  // ── PRIMARY PATH: secure render job (this is what "Render MP4" sends) ──────
   if (jobId && token) {
     const qs = new URLSearchParams({ jobId, token })
-    const finalUrl = `${origin}/capture?${qs.toString()}`
-    log.log('buildCaptureUrl() → using PRIMARY job path (jobId/token). Built URL:', finalUrl.replace(token, `${token.slice(0, 8)}...`))
-    return finalUrl
+    log.log('buildCaptureUrl → PRIMARY job path')
+    return `${origin}/capture?${qs.toString()}`
   }
-
-  // ── FALLBACK PATH: public link by ids (manual testing / public share link) ─
   if (projectId && flowId) {
     const qs = new URLSearchParams({ projectId, flowId })
     if (seq)      qs.set('seq', seq)
     if (theme)    qs.set('theme', theme)
     if (duration) qs.set('duration', String(duration))
-    const finalUrl = `${origin}/capture?${qs.toString()}`
-    log.log('buildCaptureUrl() → using FALLBACK public-link path (projectId/flowId). Built URL:', finalUrl)
-    return finalUrl
+    log.log('buildCaptureUrl → FALLBACK public-link path')
+    return `${origin}/capture?${qs.toString()}`
   }
-
-  log.error('buildCaptureUrl() → Missing jobId/token (and no projectId/flowId, and no url)')
   throw new Error('Missing jobId/token (or projectId/flowId, or url)')
 }
 
-// ── POST /render — kick off a background render, return the fileName now ──────
+// ── POST /render — runs all 3 capture methods, stacks them, returns one file ──
 app.post('/render', async (req, res) => {
   __renderCounter += 1
   const renderId = `r${__renderCounter}-${Date.now()}`
   const log = makeLogger(renderId)
-
-  const safeBody = { ...(req.body || {}) }
-  if (safeBody.token) safeBody.token = `${String(safeBody.token).slice(0, 8)}...`
-  log.log('POST /render received. body =', JSON.stringify(safeBody))
 
   const { baseUrl, url, jobId, token, projectId, flowId, seq, theme, duration } = req.body || {}
 
@@ -152,314 +103,379 @@ app.post('/render', async (req, res) => {
     return res.status(400).json({ error: err.message })
   }
 
-  const fileName = `nemo-${Date.now()}.mp4`
-  const outPath  = path.join(OUTPUT_DIR, fileName)
+  const fallbackDurationMs = Number(duration) || 8_000 // keep comparison runs short by default
+  const compareFileName = `compare-${Date.now()}.mp4`
+  const comparePath = path.join(OUTPUT_DIR, compareFileName)
 
-  log.log('fileName =', fileName)
-  log.log('outPath  =', outPath)
-  log.log('Kicking off renderCapture() in background...')
+  log.log('captureUrl =', captureUrl)
+  log.log('fallbackDurationMs =', fallbackDurationMs)
+  log.log('Kicking off 3-method comparison run in background...')
 
-  // Render in the background; the app polls GET /download/:fileName.
-  renderCapture({ captureUrl, fallbackDurationMs: Number(duration) || undefined, outPath, log })
-    .then(() => {
-      log.log('✅ renderCapture() completed successfully. Total time:', `${Date.now() - log.start}ms`)
-      try {
-        const stat = statSync(outPath)
-        log.log('Output file size:', stat.size, 'bytes')
-      } catch (statErr) {
-        log.warn('Could not stat output file after completion:', statErr.message)
-      }
+  runComparison({ captureUrl, fallbackDurationMs, comparePath, log })
+    .then((result) => {
+      log.log('✅ Comparison run complete:', JSON.stringify(result))
     })
     .catch((err) => {
-      log.error('renderCapture() FAILED:', err?.message || err)
-      log.error('Stack trace:', err?.stack || '(no stack)')
+      log.error('Comparison run FAILED:', err?.message || err)
+      log.error('Stack:', err?.stack || '(no stack)')
     })
 
-  log.log('Responding 202 to caller immediately (render continues async)')
-  return res.status(202).json({ fileName })
+  // Respond immediately with the filenames the client will poll for.
+  return res.status(202).json({
+    compareFileName,
+    methodFileNames: {
+      driven:   compareFileName.replace('compare-', 'method-A-driven-'),
+      realtime: compareFileName.replace('compare-', 'method-B-realtime-'),
+      native:   compareFileName.replace('compare-', 'method-C-native-'),
+    },
+    note: 'Download compareFileName for the side-by-side video. Download the individual methodFileNames to inspect each one alone.',
+  })
 })
 
-// ── GET /download/:fileName ──────────────────────────────────────────────────
 app.get('/download/:fileName', async (req, res) => {
   const fileName = path.basename(req.params.fileName)
   const filePath = path.join(OUTPUT_DIR, fileName)
-  console.log(`[download] requested fileName=${fileName} → filePath=${filePath}`)
-
   if (!existsSync(filePath)) {
-    console.warn(`[download] ⚠️ Not ready / not found: ${filePath}`)
+    console.warn(`[download] ⚠️ Not ready: ${filePath}`)
     return res.status(404).json({ error: 'Not ready' })
   }
-
-  try {
-    const stat = statSync(filePath)
-    console.log(`[download] found file, size=${stat.size} bytes — sending...`)
-  } catch (e) {
-    console.warn('[download] could not stat file before sending:', e.message)
-  }
-
+  const stat = statSync(filePath)
+  console.log(`[download] sending ${fileName} (${stat.size} bytes)`)
   res.setHeader('Content-Type', 'video/mp4')
   res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`)
-  res.sendFile(filePath, (err) => {
-    if (err) {
-      console.error(`[download] ❌ error sending file ${filePath}:`, err.message)
-    } else {
-      console.log(`[download] ✅ sent file ${filePath}`)
-    }
-  })
+  res.sendFile(filePath)
 })
 
-// ── Core: frame-by-frame capture of the real /capture page ───────────────────
-async function renderCapture({ captureUrl, fallbackDurationMs, outPath, log }) {
-  log.log('renderCapture() START')
-  log.log('  captureUrl          =', captureUrl)
-  log.log('  fallbackDurationMs  =', fallbackDurationMs)
-  log.log('  outPath             =', outPath)
-
-  log.log('Ensuring OUTPUT_DIR exists:', OUTPUT_DIR)
+// ── Orchestrator: run all 3 methods, then stack ────────────────────────────
+async function runComparison({ captureUrl, fallbackDurationMs, comparePath, log }) {
   await mkdir(OUTPUT_DIR, { recursive: true })
-  log.log('OUTPUT_DIR ready')
+  await mkdir(TMP_DIR, { recursive: true })
 
-  log.log('Launching Chromium (headless)...')
-  const browserLaunchStart = Date.now()
+  const stamp = path.basename(comparePath).replace('compare-', '').replace('.mp4', '')
+  const pathA = path.join(OUTPUT_DIR, `method-A-driven-${stamp}.mp4`)
+  const pathB = path.join(OUTPUT_DIR, `method-B-realtime-${stamp}.mp4`)
+  const pathC = path.join(OUTPUT_DIR, `method-C-native-${stamp}.mp4`)
+
+  log.log('Launching shared browser instance...')
   const browser = await chromium.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-dev-shm-usage', '--hide-scrollbars'],
+    args: ['--no-sandbox', '--disable-dev-shm-usage', '--hide-scrollbars',
+           // Helps WebGL/canvas content actually paint in headless — relevant
+           // since native recording (method C) is our control for "does GPU
+           // content even render at all".
+           '--use-gl=swiftshader', '--enable-unsafe-swiftshader'],
   })
-  log.log(`Chromium launched in ${Date.now() - browserLaunchStart}ms`)
 
-  browser.on('disconnected', () => log.error('Browser DISCONNECTED unexpectedly'))
+  const results = { driven: null, realtime: null, native: null }
 
   try {
-    log.log('Creating browser context. viewport =', { width: WIDTH, height: HEIGHT }, 'deviceScaleFactor =', SCALE)
-    const context = await browser.newContext({
-      viewport: { width: WIDTH, height: HEIGHT },
-      deviceScaleFactor: SCALE,
-    })
-    log.log('Context created')
+    log.log('── METHOD A: driven (virtual clock) ──────────────────────')
+    try {
+      await captureDriven({ browser, captureUrl, fallbackDurationMs, outPath: pathA, log: makeLogger(`${log.id}:A`) })
+      results.driven = { ok: true, path: pathA, size: statSync(pathA).size }
+    } catch (err) {
+      log.error('Method A failed:', err.message)
+      results.driven = { ok: false, error: err.message }
+    }
 
-    await context.addInitScript(() => {
-      window.__nemoCaptureDriven = true
-    })
-    log.log('Init script injected: window.__nemoCaptureDriven = true')
+    log.log('── METHOD B: realtime screenshot loop ─────────────────────')
+    try {
+      await captureRealtime({ browser, captureUrl, fallbackDurationMs, outPath: pathB, log: makeLogger(`${log.id}:B`) })
+      results.realtime = { ok: true, path: pathB, size: statSync(pathB).size }
+    } catch (err) {
+      log.error('Method B failed:', err.message)
+      results.realtime = { ok: false, error: err.message }
+    }
 
-    log.log('Opening new page...')
-    const page = await context.newPage()
-    log.log('Page created')
+    log.log('── METHOD C: native Chromium video recording ──────────────')
+    try {
+      await captureNative({ browser, captureUrl, fallbackDurationMs, outPath: pathC, log: makeLogger(`${log.id}:C`) })
+      results.native = { ok: true, path: pathC, size: statSync(pathC).size }
+    } catch (err) {
+      log.error('Method C failed:', err.message)
+      results.native = { ok: false, error: err.message }
+    }
+  } finally {
+    await browser.close().catch(() => {})
+    log.log('Shared browser closed')
+  }
 
-    // Pipe ALL browser-side console output back to our logs.
-    page.on('console', (msg) => {
-      log.log(`[page console:${msg.type()}]`, msg.text())
-    })
-    page.on('pageerror', (err) => {
-      log.error('[page pageerror]', err.message)
-    })
-    page.on('requestfailed', (request) => {
-      log.error('[page requestfailed]', request.method(), request.url(), '→', request.failure()?.errorText)
-    })
-    page.on('response', (response) => {
-      const status = response.status()
-      if (status >= 400) {
-        log.warn('[page response]', status, response.url())
-      } else {
-        log.log('[page response]', status, response.url())
-      }
-    })
-    page.on('crash', () => {
-      log.error('[page] PAGE CRASHED')
-    })
-    page.on('close', () => {
-      log.log('[page] page closed')
-    })
-    log.log('Page event listeners attached (console, pageerror, requestfailed, response, crash, close)')
+  log.log('Results summary:', JSON.stringify(results, null, 2))
 
-    log.log('Installing virtual clock at time=0...')
+  log.log('Stacking the 3 outputs (that succeeded) into comparison video...')
+  await stackVideos({
+    inputs: [
+      { path: pathA, label: 'A: DRIVEN (virtual clock)', ok: results.driven?.ok },
+      { path: pathB, label: 'B: REALTIME (wall clock)',  ok: results.realtime?.ok },
+      { path: pathC, label: 'C: NATIVE (Chromium record)', ok: results.native?.ok },
+    ],
+    outPath: comparePath,
+    log,
+  })
+
+  return results
+}
+
+// ── METHOD A: driven — virtual clock + manual screenshot loop ─────────────
+async function captureDriven({ browser, captureUrl, fallbackDurationMs, outPath, log }) {
+  const context = await browser.newContext({
+    viewport: { width: WIDTH, height: HEIGHT },
+    deviceScaleFactor: SCALE,
+  })
+  await context.addInitScript(() => { window.__nemoCaptureDriven = true })
+  const page = await context.newPage()
+  attachPageLogging(page, log)
+
+  try {
+    log.log('Installing virtual clock...')
     await page.clock.install({ time: 0 })
-    log.log('Virtual clock installed')
 
-    log.log('Navigating to captureUrl (waitUntil=load, timeout=45000ms)...')
-    const navStart = Date.now()
-    try {
-      await page.goto(captureUrl, { waitUntil: 'load', timeout: 45_000 })
-      log.log(`Navigation completed in ${Date.now() - navStart}ms`)
-    } catch (navErr) {
-      log.error(`Navigation FAILED after ${Date.now() - navStart}ms:`, navErr.message)
-      throw navErr
-    }
-
-    log.log('Running virtual clock forward 1300ms to let scene mount + settle timer fire...')
+    await page.goto(captureUrl, { waitUntil: 'load', timeout: 45_000 })
     await page.clock.runFor(1300)
-    log.log('Clock advanced 1300ms')
 
-    log.log('Checking window.__nemoCaptureError ...')
     const captureError = await page.evaluate(() => window.__nemoCaptureError || null)
-    if (captureError) {
-      // Most common real-world cause here: expired/invalid job token.
-      log.error('Page reported __nemoCaptureError:', captureError, '(check: expired or invalid jobId/token?)')
-      throw new Error(`Capture page error: ${captureError}`)
-    }
-    log.log('No __nemoCaptureError reported (yet)')
+    if (captureError) throw new Error(`Page reported error: ${captureError}`)
 
-    log.log('Waiting for window.__nemoCaptureReady === true (timeout=30000ms)...')
-    const readyStart = Date.now()
-    try {
-      await page.waitForFunction(() => window.__nemoCaptureReady === true, { timeout: 30_000 })
-      log.log(`__nemoCaptureReady became true after ${Date.now() - readyStart}ms`)
-    } catch (readyErr) {
-      log.error(`Timed out waiting for __nemoCaptureReady after ${Date.now() - readyStart}ms:`, readyErr.message)
-      try {
-        const diag = await page.evaluate(() => ({
-          ready: window.__nemoCaptureReady,
-          error: window.__nemoCaptureError,
-          driven: window.__nemoCaptureDriven,
-          durationMs: window.__nemoCaptureDurationMs,
-          readyState: document.readyState,
-          bodyHTMLLength: document.body ? document.body.innerHTML.length : -1,
-        }))
-        log.error('Diagnostic page state at timeout:', JSON.stringify(diag))
-      } catch (diagErr) {
-        log.error('Could not even evaluate diagnostic state:', diagErr.message)
-      }
-      try {
-        const debugPng = await page.screenshot({ type: 'png' })
-        log.error('Captured a debug screenshot at timeout, size =', debugPng.length, 'bytes')
-      } catch (shotErr) {
-        log.error('Could not even take a debug screenshot:', shotErr.message)
-      }
-      throw readyErr
-    }
+    await page.waitForFunction(() => window.__nemoCaptureReady === true, { timeout: 30_000 })
 
-    log.log('Reading window.__nemoCaptureDurationMs ...')
     const reportedDurationMs = await page.evaluate(() => window.__nemoCaptureDurationMs)
-    log.log('  reportedDurationMs =', reportedDurationMs)
-    log.log('  fallbackDurationMs =', fallbackDurationMs)
-    const durationMs = reportedDurationMs || fallbackDurationMs || 20_000
-    log.log('  → using durationMs =', durationMs, reportedDurationMs ? '(from page)' : (fallbackDurationMs ? '(from fallback param)' : '(hardcoded default 20000)'))
+    const durationMs = reportedDurationMs || fallbackDurationMs
+    log.log('durationMs =', durationMs, reportedDurationMs ? '(from page)' : '(fallback)')
 
-    const frameMs     = 1000 / FPS
+    const frameMs = 1000 / FPS
     const totalFrames = Math.round((durationMs / 1000) * FPS) + 1
-    log.log('  frameMs     =', frameMs)
-    log.log('  totalFrames =', totalFrames)
+    log.log('totalFrames =', totalFrames)
 
-    log.log('Calling window.__nemoCaptureStart() to begin playback...')
-    const startFnExists = await page.evaluate(() => typeof window.__nemoCaptureStart === 'function')
-    log.log('  window.__nemoCaptureStart is a function?', startFnExists)
-    if (!startFnExists) {
-      log.warn('  ⚠️ __nemoCaptureStart is NOT defined on the page — playback will likely never advance!')
-    }
     await page.evaluate(() => window.__nemoCaptureStart && window.__nemoCaptureStart())
-    log.log('__nemoCaptureStart() invoked')
 
-    log.log('Spawning ffmpeg process → output:', outPath)
     const ff = spawnFfmpeg(outPath, log)
-
-    log.log(`Starting frame capture loop: ${totalFrames} frames @ ${FPS}fps (${durationMs}ms)`)
     let advancedMs = 0
-    const loopStart = Date.now()
-    let lastLogAt = 0
-
     for (let i = 0; i < totalFrames; i++) {
       const targetMs = Math.round(i * frameMs)
       const step = targetMs - advancedMs
       advancedMs = targetMs
-
-      if (step > 0) {
-        await page.clock.runFor(step)
-      }
-
-      const frameStart = Date.now()
+      if (step > 0) await page.clock.runFor(step)
       const png = await page.screenshot({ type: 'png' })
-      const frameElapsed = Date.now() - frameStart
-
-      if (i % 30 === 0 || frameElapsed > 500) {
-        log.log(`  frame ${i + 1}/${totalFrames} | targetMs=${targetMs} | screenshot took ${frameElapsed}ms | bytes=${png.length}`)
-      }
-      if (frameElapsed > 2000) {
-        log.warn(`  frame ${i + 1}/${totalFrames} took ${frameElapsed}ms — unusually slow, possible page hang/heavy repaint`)
-      }
-
-      const canWrite = ff.stdin.write(png)
-      if (!canWrite) {
-        const drainStart = Date.now()
-        log.log(`  ffmpeg stdin backpressure at frame ${i + 1} — waiting for drain...`)
-        await new Promise((resolve) => ff.stdin.once('drain', resolve))
-        log.log(`  drained after ${Date.now() - drainStart}ms`)
-      }
-
-      if (Date.now() - lastLogAt > 5000) {
-        log.log(`  ...heartbeat: frame ${i + 1}/${totalFrames}, elapsed ${Date.now() - loopStart}ms total`)
-        lastLogAt = Date.now()
-      }
+      if (i % 30 === 0) log.log(`frame ${i + 1}/${totalFrames}, bytes=${png.length}`)
+      if (!ff.stdin.write(png)) await new Promise((r) => ff.stdin.once('drain', r))
     }
-
-    log.log(`Frame capture loop finished. Total loop time: ${Date.now() - loopStart}ms`)
-    log.log('Closing ffmpeg stdin (signals end of stream)...')
     ff.stdin.end()
-    log.log('Waiting for ffmpeg to finish encoding...')
-    const ffStart = Date.now()
     await ff.done
-    log.log(`ffmpeg finished encoding in ${Date.now() - ffStart}ms`)
-  } catch (err) {
-    log.error('renderCapture() threw:', err?.message || err)
-    throw err
+    log.log('Method A done →', outPath)
   } finally {
-    log.log('Closing browser...')
-    const closeStart = Date.now()
-    await browser.close().catch((closeErr) => {
-      log.warn('Error while closing browser (ignored):', closeErr.message)
-    })
-    log.log(`Browser closed in ${Date.now() - closeStart}ms`)
-    log.log('renderCapture() END')
+    await context.close().catch(() => {})
   }
 }
 
-// ── ffmpeg: assemble a stream of PNG frames (stdin) into an H.264 MP4 ─────────
+// ── METHOD B: realtime — no clock manipulation, real wall-clock screenshots ─
+async function captureRealtime({ browser, captureUrl, fallbackDurationMs, outPath, log }) {
+  const context = await browser.newContext({
+    viewport: { width: WIDTH, height: HEIGHT },
+    deviceScaleFactor: SCALE,
+  })
+  const page = await context.newPage()
+  attachPageLogging(page, log)
+
+  try {
+    log.log('Navigating (NO virtual clock, NO driven flag)...')
+    await page.goto(captureUrl, { waitUntil: 'load', timeout: 45_000 })
+
+    // Real wait — let any natural autoplay/load sequence settle.
+    await page.waitForTimeout(1300)
+
+    // If the page exposes ready/start hooks, use them — but don't require it.
+    const hasReady = await page.evaluate(() => typeof window.__nemoCaptureReady !== 'undefined')
+    if (hasReady) {
+      log.log('Page exposes __nemoCaptureReady — waiting for it in real time...')
+      await page.waitForFunction(() => window.__nemoCaptureReady === true, { timeout: 30_000 }).catch((e) => {
+        log.warn('Timed out waiting for __nemoCaptureReady in realtime mode, continuing anyway:', e.message)
+      })
+    } else {
+      log.log('Page does not expose __nemoCaptureReady — assuming it plays on its own once loaded.')
+    }
+
+    const hasStart = await page.evaluate(() => typeof window.__nemoCaptureStart === 'function')
+    if (hasStart) {
+      log.log('Calling __nemoCaptureStart() (real time)...')
+      await page.evaluate(() => window.__nemoCaptureStart())
+    } else {
+      log.log('No __nemoCaptureStart — relying on the page auto-playing by itself (real public-page behavior).')
+    }
+
+    const durationMs = fallbackDurationMs
+    const frameMs = 1000 / FPS
+    const totalFrames = Math.round((durationMs / 1000) * FPS) + 1
+    log.log('durationMs =', durationMs, '| totalFrames =', totalFrames)
+
+    const ff = spawnFfmpeg(outPath, log)
+    const loopStart = Date.now()
+    for (let i = 0; i < totalFrames; i++) {
+      const targetMs = i * frameMs
+      const waitMs = targetMs - (Date.now() - loopStart)
+      if (waitMs > 0) await page.waitForTimeout(waitMs)
+      const png = await page.screenshot({ type: 'png' })
+      if (i % 30 === 0) log.log(`frame ${i + 1}/${totalFrames}, bytes=${png.length}, realElapsed=${Date.now() - loopStart}ms`)
+      if (!ff.stdin.write(png)) await new Promise((r) => ff.stdin.once('drain', r))
+    }
+    ff.stdin.end()
+    await ff.done
+    log.log('Method B done →', outPath)
+  } finally {
+    await context.close().catch(() => {})
+  }
+}
+
+// ── METHOD C: native — Chromium's own video recorder (real compositor) ─────
+async function captureNative({ browser, captureUrl, fallbackDurationMs, outPath, log }) {
+  const recordDir = path.join(TMP_DIR, `native-${Date.now()}`)
+  await mkdir(recordDir, { recursive: true })
+
+  const context = await browser.newContext({
+    viewport: { width: WIDTH, height: HEIGHT },
+    recordVideo: { dir: recordDir, size: { width: WIDTH, height: HEIGHT } },
+  })
+  const page = await context.newPage()
+  attachPageLogging(page, log)
+
+  try {
+    log.log('Navigating (native recording active, real time, real compositor)...')
+    await page.goto(captureUrl, { waitUntil: 'load', timeout: 45_000 })
+    await page.waitForTimeout(1300)
+
+    const hasReady = await page.evaluate(() => typeof window.__nemoCaptureReady !== 'undefined')
+    if (hasReady) {
+      await page.waitForFunction(() => window.__nemoCaptureReady === true, { timeout: 30_000 }).catch((e) => {
+        log.warn('Timed out waiting for __nemoCaptureReady in native mode, continuing anyway:', e.message)
+      })
+    }
+    const hasStart = await page.evaluate(() => typeof window.__nemoCaptureStart === 'function')
+    if (hasStart) {
+      await page.evaluate(() => window.__nemoCaptureStart())
+    }
+
+    const durationMs = fallbackDurationMs
+    log.log(`Letting it play for ${durationMs}ms in real time while Chromium records natively...`)
+    await page.waitForTimeout(durationMs)
+
+    log.log('Closing context to flush the native recording...')
+    const video = page.video()
+    await context.close()
+    const rawPath = await video.path()
+    log.log('Native recording saved at', rawPath)
+
+    log.log('Transcoding native .webm → .mp4 with ffmpeg...')
+    await transcodeToMp4(rawPath, outPath, log)
+    log.log('Method C done →', outPath)
+  } catch (err) {
+    await context.close().catch(() => {})
+    throw err
+  } finally {
+    await rm(recordDir, { recursive: true, force: true }).catch(() => {})
+  }
+}
+
+// ── Shared: page-level console/error logging ────────────────────────────────
+function attachPageLogging(page, log) {
+  page.on('console', (msg) => log.log(`[page console:${msg.type()}]`, msg.text()))
+  page.on('pageerror', (err) => log.error('[page pageerror]', err.message))
+  page.on('requestfailed', (r) => log.error('[page requestfailed]', r.method(), r.url(), '→', r.failure()?.errorText))
+  page.on('response', (r) => { if (r.status() >= 400) log.warn('[page response]', r.status(), r.url()) })
+  page.on('crash', () => log.error('[page] CRASHED'))
+}
+
+// ── ffmpeg: PNG stream → mp4 ────────────────────────────────────────────────
 function spawnFfmpeg(output, log) {
   const args = [
-    '-y',
-    '-f', 'image2pipe',
-    '-framerate', String(FPS),
-    '-i', 'pipe:0',
+    '-y', '-f', 'image2pipe', '-framerate', String(FPS), '-i', 'pipe:0',
     '-vf', `scale=${WIDTH}:${HEIGHT}:flags=lanczos,format=yuv420p`,
-    '-c:v', 'libx264',
-    '-preset', 'slow',
-    '-crf', CRF,
-    '-tune', 'animation',
-    '-pix_fmt', 'yuv420p',
-    '-movflags', '+faststart',
-    output,
+    '-c:v', 'libx264', '-preset', 'slow', '-crf', CRF, '-tune', 'animation',
+    '-pix_fmt', 'yuv420p', '-movflags', '+faststart', output,
   ]
-  log.log('spawnFfmpeg() args:', args.join(' '))
   const ff = spawn(ffmpegPath, args)
-
-  ff.on('spawn', () => log.log('ffmpeg process spawned, pid =', ff.pid))
-  ff.on('error', (err) => log.error('ffmpeg process error event:', err.message))
-
   let stderr = ''
-  ff.stderr.on('data', (d) => {
-    const chunk = d.toString()
-    stderr += chunk
-    log.log('[ffmpeg stderr]', chunk.trim())
-  })
-  ff.stdin.on('error', (err) => {
-    log.error('ffmpeg stdin error:', err.message)
-  })
-
+  ff.stderr.on('data', (d) => { stderr += d.toString() })
   const done = new Promise((resolve, reject) => {
     ff.on('error', reject)
-    ff.on('close', (code, signal) => {
-      log.log(`ffmpeg process closed. code=${code} signal=${signal}`)
-      if (code === 0) {
-        resolve(output)
-      } else {
-        log.error('ffmpeg failed. Last stderr output:', stderr.slice(-1500))
-        reject(new Error(`ffmpeg exited with ${code}: ${stderr.slice(-800)}`))
-      }
+    ff.on('close', (code) => {
+      if (code === 0) resolve(output)
+      else { log.error('ffmpeg failed:', stderr.slice(-1000)); reject(new Error(`ffmpeg exited ${code}`)) }
     })
   })
   return { stdin: ff.stdin, done }
 }
 
+// ── ffmpeg: transcode any video (e.g. webm) → mp4 ───────────────────────────
+function transcodeToMp4(inputPath, outputPath, log) {
+  return new Promise((resolve, reject) => {
+    const args = ['-y', '-i', inputPath, '-c:v', 'libx264', '-preset', 'slow',
+                  '-crf', CRF, '-pix_fmt', 'yuv420p', '-movflags', '+faststart', outputPath]
+    const ff = spawn(ffmpegPath, args)
+    let stderr = ''
+    ff.stderr.on('data', (d) => { stderr += d.toString() })
+    ff.on('error', reject)
+    ff.on('close', (code) => {
+      if (code === 0) resolve(outputPath)
+      else { log.error('transcode failed:', stderr.slice(-1000)); reject(new Error(`ffmpeg transcode exited ${code}`)) }
+    })
+  })
+}
+
+// ── ffmpeg: stack up to 3 mp4s vertically with labels into one file ────────
+async function stackVideos({ inputs, outPath, log }) {
+  const usable = inputs.filter((i) => i.ok && existsSync(i.path))
+  log.log(`stackVideos: ${usable.length}/${inputs.length} methods produced usable output`)
+
+  if (usable.length === 0) {
+    log.error('No method produced output — cannot build comparison video')
+    throw new Error('All 3 capture methods failed — see logs above for each')
+  }
+
+  const args = ['-y']
+  usable.forEach((i) => args.push('-i', i.path))
+
+  const scaleLabel = usable
+    .map((i, idx) =>
+      `[${idx}:v]scale=640:-2,setpts=PTS-STARTPTS,drawtext=text='${i.label.replace(/'/g, "")}':fontcolor=white:fontsize=20:x=10:y=10:box=1:boxcolor=black@0.6[v${idx}]`
+    )
+    .join(';')
+  const stackInputs = usable.map((_, idx) => `[v${idx}]`).join('')
+  const filter = `${scaleLabel};${stackInputs}vstack=${usable.length}[outv]`
+
+  args.push('-filter_complex', filter, '-map', '[outv]', '-c:v', 'libx264', '-preset', 'slow', '-crf', CRF, '-pix_fmt', 'yuv420p', outPath)
+
+  log.log('stackVideos ffmpeg args:', args.join(' '))
+
+  await new Promise((resolve, reject) => {
+    const ff = spawn(ffmpegPath, args)
+    let stderr = ''
+    ff.stderr.on('data', (d) => { stderr += d.toString() })
+    ff.on('error', reject)
+    ff.on('close', (code) => {
+      if (code === 0) {
+        log.log('Comparison video built successfully →', outPath)
+        resolve()
+      } else {
+        log.error('Stacking with drawtext failed, retrying WITHOUT labels (font issue is common cause):', stderr.slice(-800))
+        // Retry without drawtext in case fontconfig isn't available in the image.
+        const simpleFilter = usable
+          .map((_, idx) => `[${idx}:v]scale=640:-2,setpts=PTS-STARTPTS[v${idx}]`)
+          .join(';') + ';' + usable.map((_, idx) => `[v${idx}]`).join('') + `vstack=${usable.length}[outv]`
+        const retryArgs = ['-y']
+        usable.forEach((i) => retryArgs.push('-i', i.path))
+        retryArgs.push('-filter_complex', simpleFilter, '-map', '[outv]', '-c:v', 'libx264', '-preset', 'slow', '-crf', CRF, '-pix_fmt', 'yuv420p', outPath)
+        const ff2 = spawn(ffmpegPath, retryArgs)
+        let stderr2 = ''
+        ff2.stderr.on('data', (d) => { stderr2 += d.toString() })
+        ff2.on('error', reject)
+        ff2.on('close', (code2) => {
+          if (code2 === 0) { log.log('Comparison video built (no labels, fallback) →', outPath); resolve() }
+          else { log.error('Fallback stacking also failed:', stderr2.slice(-1000)); reject(new Error('ffmpeg stacking failed twice')) }
+        })
+      }
+    })
+  })
+}
+
 app.listen(PORT, () => {
-  console.log(`[capture] frame-by-frame worker listening on :${PORT}`)
-  console.log(`[capture] output dir: ${OUTPUT_DIR} | ${WIDTH}x${HEIGHT}@${FPS} scale=${SCALE} crf=${CRF}`)
+  console.log(`[capture] worker listening on :${PORT} | ${WIDTH}x${HEIGHT}@${FPS} scale=${SCALE} crf=${CRF}`)
 })
