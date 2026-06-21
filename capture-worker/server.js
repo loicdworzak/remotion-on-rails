@@ -20,7 +20,7 @@ const DEFAULT_BASE_URL = process.env.CAPTURE_BASE_URL || ''
 const OUTPUT_DIR = process.env.CAPTURE_OUTPUT_DIR || path.join(tmpdir(), 'nemo-captures')
 
 const app = express()
-app.use(express.json({ limit: '2mb' })) // payload is tiny now — just ids + params
+app.use(express.json({ limit: '2mb' }))
 
 // ── Optional bearer auth ──────────────────────────────────────────────────────
 app.use((req, res, next) => {
@@ -32,28 +32,44 @@ app.use((req, res, next) => {
 
 app.get('/health', (_req, res) => res.json({ ok: true }))
 
-// ── Build the public /capture URL the page expects ────────────────────────────
-// The page is self-contained: it loads the flow from /api/public/flow using
-// projectId + flowId, applies `theme`, and exposes the __nemoCapture* flags.
-function buildCaptureUrl({ baseUrl, url, projectId, flowId, seq, theme, duration }) {
-  if (url) return url // caller passed a full public link verbatim
+// ── Build the /capture URL the page expects ───────────────────────────────────
+// THE APP'S ACTUAL CONTRACT is the secure render-job one:
+//   POST /render { baseUrl, jobId, token }
+// The /capture page loads the flow + sequence from the DB via the time-limited
+// job token. projectId/flowId are NEVER needed here — the token identifies the
+// job. We still accept { url } (a full public link) and { projectId, flowId, … }
+// as conveniences for the public-link flow, but jobId+token is the primary path.
+function buildCaptureUrl({ baseUrl, url, jobId, token, projectId, flowId, seq, theme, duration }) {
+  if (url) return url // caller passed a full public/job link verbatim
+
   const origin = (baseUrl || DEFAULT_BASE_URL).replace(/\/$/, '')
   if (!origin) throw new Error('Missing baseUrl (and no CAPTURE_BASE_URL set)')
-  if (!projectId || !flowId) throw new Error('Missing projectId or flowId')
-  const qs = new URLSearchParams({ projectId, flowId })
-  if (seq)      qs.set('seq', seq)
-  if (theme)    qs.set('theme', theme)
-  if (duration) qs.set('duration', String(duration))
-  return `${origin}/capture?${qs.toString()}`
+
+  // Primary path: secure render job (this is what "Render MP4" sends).
+  if (jobId && token) {
+    const qs = new URLSearchParams({ jobId, token })
+    return `${origin}/capture?${qs.toString()}`
+  }
+
+  // Fallback path: public link by ids.
+  if (projectId && flowId) {
+    const qs = new URLSearchParams({ projectId, flowId })
+    if (seq)      qs.set('seq', seq)
+    if (theme)    qs.set('theme', theme)
+    if (duration) qs.set('duration', String(duration))
+    return `${origin}/capture?${qs.toString()}`
+  }
+
+  throw new Error('Missing jobId/token (or projectId/flowId, or url)')
 }
 
 // ── POST /render — kick off a background render, return the fileName now ──────
 app.post('/render', async (req, res) => {
-  const { baseUrl, url, projectId, flowId, seq, theme, duration } = req.body || {}
+  const { baseUrl, url, jobId, token, projectId, flowId, seq, theme, duration } = req.body || {}
 
   let captureUrl
   try {
-    captureUrl = buildCaptureUrl({ baseUrl, url, projectId, flowId, seq, theme, duration })
+    captureUrl = buildCaptureUrl({ baseUrl, url, jobId, token, projectId, flowId, seq, theme, duration })
   } catch (err) {
     return res.status(400).json({ error: err.message })
   }
@@ -88,34 +104,30 @@ async function renderCapture({ captureUrl, fallbackDurationMs, outPath }) {
   })
 
   try {
-    // Supersample: render the page at SCALE× device pixels, then downscale in
-    // ffmpeg → crisp text + smooth gradients.
+    // Supersample: render at SCALE× device pixels, downscale in ffmpeg → crisp.
     const context = await browser.newContext({
       viewport: { width: WIDTH, height: HEIGHT },
       deviceScaleFactor: SCALE,
     })
 
-    // Flag driven-mode BEFORE any page script runs, so the /capture page does
-    // NOT auto-play — we drive it under the virtual clock. The flow + sequence
-    // are loaded by the page itself from the URL (no sessionStorage injection).
+    // Flag driven-mode BEFORE any page script runs → the /capture page does NOT
+    // auto-play; we drive it under the virtual clock. The flow + sequence are
+    // loaded by the page itself (from the job token in the URL).
     await context.addInitScript(() => {
       window.__nemoCaptureDriven = true
     })
 
     const page = await context.newPage()
 
-    // Virtual clock: controls Date, setTimeout, setInterval, performance.now()
-    // and requestAnimationFrame. Advancing it steps the playback loop AND the
-    // camera transitions deterministically, one frame at a time.
+    // Virtual clock: controls Date, timers, performance.now() and rAF.
     await page.clock.install({ time: 0 })
 
     await page.goto(captureUrl, { waitUntil: 'load', timeout: 45_000 })
 
-    // Let the scene mount + fire its settle timer (sets ready). Driven mode
-    // means it will NOT auto-play.
+    // Let the scene mount + fire its settle timer (sets ready). It won't play.
     await page.clock.runFor(1300)
 
-    // Fail fast if the page reported a load error (bad ids, no sequence, …).
+    // Fail fast if the page reported a load error (bad/expired token, …).
     const captureError = await page.evaluate(() => window.__nemoCaptureError || null)
     if (captureError) throw new Error(`Capture page error: ${captureError}`)
 
@@ -136,8 +148,6 @@ async function renderCapture({ captureUrl, fallbackDurationMs, outPath }) {
 
     let advancedMs = 0
     for (let i = 0; i < totalFrames; i++) {
-      // Advance the clock to this frame's timestamp using integer steps to
-      // avoid sub-ms drift, then fire the pending rAF tick.
       const targetMs = Math.round(i * frameMs)
       const step = targetMs - advancedMs
       advancedMs = targetMs
@@ -163,12 +173,11 @@ function spawnFfmpeg(output) {
     '-f', 'image2pipe',
     '-framerate', String(FPS),
     '-i', 'pipe:0',
-    // Downscale the supersampled frames to output size, then 8-bit yuv420p.
     '-vf', `scale=${WIDTH}:${HEIGHT}:flags=lanczos,format=yuv420p`,
     '-c:v', 'libx264',
     '-preset', 'slow',
     '-crf', CRF,
-    '-tune', 'animation', // flat-color UI / gradients
+    '-tune', 'animation',
     '-pix_fmt', 'yuv420p',
     '-movflags', '+faststart',
     output,
